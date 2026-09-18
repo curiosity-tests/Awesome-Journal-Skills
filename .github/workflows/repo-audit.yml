@@ -22,7 +22,7 @@ on:
   schedule:
     # Weekly freshness run (Mon 02:17 UTC) so content rot is caught even when
     # no one is pushing. The external-link job below only runs on this trigger.
-    - cron: "17 2 * * 1"
+  - cron: "17 2 * * 1"
 
 
 env:
@@ -43,74 +43,290 @@ jobs:
       matrix:
         python-version: ["3.9", "3.x"]
     steps:
-      - name: Checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+    - name: Checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
 
-      - name: Run standard hard checks
-        run: python3 tools/run_checks.py --skip-reports
+    - name: Run standard hard checks
+      run: python3 tools/run_checks.py --skip-reports
 
   # Advisory only: external publisher pages often answer bots with 403/429,
   # so this job reports DEAD/REDIRECT links in the run log without ever
   # failing the build (see tools/external_link_audit.py docstring).
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   external-links:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - name: Checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
+    - name: Checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.x"
 
-      - name: External link liveness report (advisory)
-        run: python3 tools/external_link_audit.py || true
+    - name: External link liveness report (advisory)
+      run: python3 tools/external_link_audit.py || true
 
   # Source-map facts (editors, fees, caps, policies) go stale on the publishers'
   # schedule, not ours. Unknown dates and records older than one year are hard
   # failures; the generated dashboard keeps the remaining backlog visible.
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   freshness:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
+    - name: Checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.x"
 
-      - name: Source-map freshness report
-        run: python3 tools/freshness_audit.py --max-age-days 365 --max-unknown 0
+    - name: Source-map freshness report
+      run: python3 tools/freshness_audit.py --max-age-days 365 --max-unknown 0
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
